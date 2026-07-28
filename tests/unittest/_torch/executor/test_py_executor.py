@@ -1302,7 +1302,7 @@ class _StubADPExecutor:
         max_num_tokens=8192,
         is_warmup=False,
         benchmark_req_queues_size=0,
-        enable_dsv4_adp_dummy_fixes=True,
+        enable_adp_dummy_fixes=True,
     ):
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1316,7 +1316,7 @@ class _StubADPExecutor:
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
-        self._enable_dsv4_adp_dummy_fixes = enable_dsv4_adp_dummy_fixes
+        self._enable_adp_dummy_fixes = enable_adp_dummy_fixes
         self.add_dummy_calls = []
 
         self.dist = Mock()
@@ -1436,9 +1436,9 @@ def test_adp_dummy_role_unchanged_when_attention_dp_disabled():
         LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
     ],
 )
-def test_disabled_dsv4_gate_preserves_existing_disagg_behavior(state):
-    # The disabled gate covers non-DSv4 and PP configurations.
-    stub = _StubADPExecutor(enable_dsv4_adp_dummy_fixes=False)
+def test_disabled_adp_dummy_fix_gate_preserves_pp_behavior(state):
+    # PP configurations remain on the established dummy path.
+    stub = _StubADPExecutor(enable_adp_dummy_fixes=False)
     stub.active_requests = [_make_adp_request(state)]
     stub.expected_num_active_requests = 1
 
@@ -1496,7 +1496,7 @@ def test_pad_dummy_allocation_failure_skips_padding():
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
 
 
-def test_dsv4_pad_dummy_checks_full_context_capacity():
+def test_adp_pad_dummy_checks_full_context_capacity():
     stub = _StubADPExecutor(max_num_tokens=4096)
     stub._adp_dummy_is_gen = False
     stub.kv_cache_manager.get_num_available_tokens.return_value = 1024
@@ -1510,7 +1510,7 @@ def test_dsv4_pad_dummy_checks_full_context_capacity():
     assert stub._pending_adp_dummy_request is None
 
 
-def test_dsv4_pad_dummy_checks_full_generation_capacity():
+def test_adp_pad_dummy_checks_full_generation_capacity():
     stub = _StubADPExecutor()
     stub.kv_cache_manager.get_num_available_tokens.return_value = 0
 
@@ -1523,7 +1523,7 @@ def test_dsv4_pad_dummy_checks_full_generation_capacity():
     assert stub._pending_adp_dummy_request is None
 
 
-def test_dsv4_pad_dummy_capacity_includes_draft_reserve():
+def test_adp_pad_dummy_capacity_includes_draft_reserve():
     stub = _StubADPExecutor()
     stub.max_total_draft_tokens = 3
     stub.kv_cache_manager.get_num_available_tokens.return_value = 3

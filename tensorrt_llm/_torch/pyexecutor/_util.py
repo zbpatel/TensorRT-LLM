@@ -2172,17 +2172,17 @@ def compute_max_num_sequences(mapping: Mapping,
     return max_batch_size * num_micro_batches
 
 
-def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
-                                       mapping: Mapping) -> bool:
-    """Gate DSv4 ADP dummy behavior while PP remains follow-up scope."""
-    return model_type == "deepseek_v4" and not mapping.has_pp()
+def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
+    """Enable transactional ADP dummy handling while PP remains follow-up."""
+    return not mapping.has_pp()
 
 
 def should_enable_dsv4_overlap_headroom(
         model_type: Optional[str], spec_config: Optional[SpeculativeConfig],
         mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
     """Gate extra sequence slots to the validated DSv4 MTP overlap path."""
-    return (should_enable_dsv4_adp_dummy_fixes(model_type, mapping)
+    return (model_type == "deepseek_v4"
+            and should_enable_adp_dummy_fixes(mapping)
             and spec_config is not None
             and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
             and not disable_overlap_scheduler)
