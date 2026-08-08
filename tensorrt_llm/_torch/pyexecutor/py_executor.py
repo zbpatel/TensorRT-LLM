@@ -3705,6 +3705,11 @@ class PyExecutor:
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
+        # A rank can have active requests while the capacity scheduler returns
+        # an empty batch. Pad after scheduling so that rank does not veto the
+        # forward pass for every attention-DP peer.
+        self._pad_empty_attention_dp_batch(scheduled_batch)
+
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
                 request.py_disable_speculative_decoding = True
@@ -5873,13 +5878,23 @@ class PyExecutor:
         if not self.enable_attention_dp:
             return
 
-        assert self.expected_num_active_requests >= len(self.active_requests)
+        expected_num_active_requests = self.expected_num_active_requests
+        if expected_num_active_requests < len(self.active_requests):
+            # The router caps its expected count after applying the per-rank
+            # load floor. A surviving pad dummy can therefore make a rank hold
+            # one more request than expected without violating capacity.
+            logger.warning(
+                f"active_requests ({len(self.active_requests)}) exceeds "
+                f"expected_num_active_requests "
+                f"({expected_num_active_requests}); tolerating (a busy rank "
+                f"needs no attention-DP dummy).")
+            expected_num_active_requests = len(self.active_requests)
         num_active_request = self._count_schedulable_active_requests()
 
         if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
             return
 
-        needs_dummy = (self.expected_num_active_requests > 0
+        needs_dummy = (expected_num_active_requests > 0
                        and num_active_request == 0)
         if not needs_dummy:
             return
@@ -5967,6 +5982,70 @@ class PyExecutor:
         dummy_request.is_attention_dp_dummy = True
         self.active_requests.append(dummy_request)
         self._pending_adp_dummy_request = dummy_request
+
+    @nvtx_range("_pad_empty_attention_dp_batch")
+    def _pad_empty_attention_dp_batch(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        """Pad a rank whose active requests produced an empty scheduled batch.
+
+        Attention-DP permits a forward only when every rank schedules a
+        non-empty batch. The pre-schedule dummy path cannot detect a request
+        that is active but does not fit the available KV cache, so add a
+        generation dummy after scheduling to keep the collectives moving.
+        """
+        if not self.enable_attention_dp:
+            return
+        if scheduled_batch is None or scheduled_batch.batch_size != 0:
+            return
+        if not self.active_requests or self.expected_num_active_requests <= 0:
+            return
+        if self._should_skip_dummy_for_benchmark_disagg(
+                self._count_schedulable_active_requests()):
+            return
+        if any(request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
+               for request in self.active_requests):
+            return
+        if not self._has_adp_dummy_kv_capacity(None):
+            logger.warning_once(
+                "attention-DP rank scheduled an empty batch and cannot afford "
+                "even a padding dummy; the forward pass is vetoed fleet-wide "
+                "this iteration",
+                key="attention_dp_empty_batch_no_pad_capacity")
+            return
+
+        dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        try:
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
+                request_ids=dummy_request_ids,
+                token_nums=None,
+                is_gen=True,
+                prepare_resource=True,
+                max_num_draft_tokens=self.max_total_draft_tokens,
+            )
+        except OutOfPagesError:
+            dummy_requests = None
+        if not dummy_requests:
+            logger.warning_once(
+                "Could not allocate the attention-DP empty-batch padding "
+                "dummy; retrying next iteration",
+                key="attention_dp_empty_batch_pad_alloc_failed")
+            return
+
+        dummy_request = dummy_requests[0]
+        spec_resource_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is not None:
+            try:
+                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+            except NoFreeSlotsError:
+                self.kv_cache_manager.free_resources(dummy_request)
+                return
+
+        dummy_request.is_attention_dp_dummy = True
+        self.active_requests.append(dummy_request)
+        scheduled_batch.generation_requests.append(dummy_request)
+        if self._enable_dsv4_adp_dummy_fixes:
+            self._pending_adp_dummy_request = dummy_request
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):

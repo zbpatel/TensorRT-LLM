@@ -1363,6 +1363,16 @@ def _run_pad(stub):
     PyExecutor._pad_attention_dp_dummy_request(stub)
 
 
+def _run_post_schedule_pad(stub, scheduled_batch):
+    for helper in (
+        "_count_schedulable_active_requests",
+        "_has_adp_dummy_kv_capacity",
+        "_should_skip_dummy_for_benchmark_disagg",
+    ):
+        setattr(stub, helper, types.MethodType(getattr(PyExecutor, helper), stub))
+    PyExecutor._pad_empty_attention_dp_batch(stub, scheduled_batch)
+
+
 def _run_update_role(stub, candidates):
     PyExecutor._update_adp_dummy_role(stub, candidates)
 
@@ -1487,6 +1497,55 @@ def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
 
     assert len(stub.add_dummy_calls) == 1
     assert len(stub.active_requests) == 2
+
+
+def test_pad_dummy_tolerates_surplus_over_expected_on_busy_rank() -> None:
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS) for _ in range(3)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls == []
+    assert len(stub.active_requests) == 3
+    assert stub.expected_num_active_requests == 2
+
+
+def test_pad_dummy_still_added_when_surplus_requests_are_unschedulable() -> None:
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE) for _ in range(3)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.expected_num_active_requests == 2
+
+
+def test_post_schedule_pad_adds_generation_dummy_to_empty_batch() -> None:
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
+    scheduled_batch = ScheduledRequests()
+
+    _run_post_schedule_pad(stub, scheduled_batch)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls[0]["is_gen"] is True
+    assert scheduled_batch.batch_size == 1
+    assert scheduled_batch.generation_requests[0].is_attention_dp_dummy
+
+
+def test_post_schedule_pad_does_not_modify_nonempty_batch() -> None:
+    stub = _StubADPExecutor()
+    request = _make_adp_request(_STATE_GENERATION_IN_PROGRESS)
+    stub.active_requests = [request]
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests.append(request)
+
+    _run_post_schedule_pad(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+    assert scheduled_batch.generation_requests == [request]
 
 
 def test_pad_dummy_allocation_failure_skips_padding():
